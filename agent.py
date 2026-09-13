@@ -11,7 +11,7 @@ from __future__ import annotations
 import random
 from typing import Iterable
 
-from sandbox.crane import action, me, tile, units, visible
+from sandbox.crane import action, me, paths, tile, units, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation, VisibleUnit
 
 
@@ -54,9 +54,29 @@ class Agent:
             firing_paths = self._attack_paths(paths, target, "archer")
             if firing_paths:
                 melee_threats = [enemy for enemy in enemies if enemy["type"] in {"cavalry", "footman"}]
-                choices = self._safe_paths(firing_paths, melee_threats) or firing_paths
-                # Kite while preserving the shot: prefer the farthest firing endpoint.
-                path = max(choices, key=lambda option: (self._distance(option[1], target["position"]), -option[0]))
+                safe_firing = self._safe_paths(firing_paths, melee_threats)
+                if safe_firing:
+                    # Kite while preserving the shot: prefer the farthest safe firing endpoint.
+                    path = max(
+                        safe_firing,
+                        key=lambda option: (self._distance(option[1], target["position"]), -option[0]),
+                    )
+                else:
+                    # If every firing endpoint is dangerous, maximize safety from every melee threat,
+                    # not merely distance from the selected target.
+                    path = max(
+                        firing_paths,
+                        key=lambda option: (
+                            min(
+                                self._distance(option[1], enemy["position"])
+                                - self._threat_range(enemy["type"])
+                                for enemy in melee_threats
+                            ),
+                            sum(self._distance(option[1], enemy["position"]) for enemy in melee_threats),
+                            self._distance(option[1], target["position"]),
+                            -option[0],
+                        ),
+                    )
                 return self._order(path[0], target["unit_id"], observation)
         enemy_goal = self._last_seen_goal("archer")
         if allies:
@@ -65,8 +85,10 @@ class Agent:
                 None,
                 observation,
             )
-        goal = enemy_goal or self._ally_goal(observation, allies) or tile.at_center(observation)
-        return self._order(self._toward(paths, goal), None, observation)
+        ally_goal = self._ally_goal(observation, allies)
+        if enemy_goal or ally_goal:
+            return self._order(self._toward(observation, paths, enemy_goal or ally_goal), None, observation)
+        return self._order(self._archer_center_path(observation, paths), None, observation)
 
     def _act_melee(self, observation: SkirmishObservation, paths: list[PathOption], enemies: list[VisibleUnit], allies: list[VisibleUnit]) -> SkirmishAction:
         unit_type = me.unit_type(observation)
@@ -76,7 +98,7 @@ class Agent:
             target = self._select_target(observation, paths, adjacent)
             return self._order(0, target["unit_id"] if target else None, observation)
 
-        archer_threats = self._archer_threats(enemies)
+        archer_threats = self._archer_threats(observation, enemies)
         if archer_threats:
             opportunistic = self._select_target(observation, paths, [enemy for enemy in enemies if enemy["type"] in {"cavalry", "footman"}])
             if opportunistic is not None:
@@ -90,24 +112,26 @@ class Agent:
             attack_paths = self._attack_paths(paths, target, unit_type)
             if attack_paths:
                 return self._order(self._toward_option(attack_paths, target["position"])[0], target["unit_id"], observation)
+            if self._threatens_visible_ally(observation, target):
+                return self._order(self._toward(observation, paths, target["position"]), None, observation)
             safer_paths = self._safe_paths(paths, [target])
-            return self._order(self._toward(safer_paths or paths, target["position"]), None, observation)
+            return self._order(self._toward(observation, safer_paths or paths, target["position"]), None, observation)
         return self._melee_rendezvous(observation, paths, allies)
 
     def _archer_response(self, observation: SkirmishObservation, paths: list[PathOption], threats: list[tuple[str, Position]]) -> SkirmishAction:
         safe_paths = self._safe_memory_paths(paths, threats)
         if me.unit_type(observation) == "footman":
-            return self._order(self._flee(safe_paths or paths, threats), None, observation)
+            return self._order(self._flee(observation, safe_paths or paths, threats), None, observation)
         # Cavalry's approved one-turn proxy: escape, else engage if possible, else partially engage.
         if safe_paths:
-            return self._order(self._flee(safe_paths, threats), None, observation)
+            return self._order(self._flee(observation, safe_paths, threats), None, observation)
         target = self._select_target(observation, paths, [enemy for enemy in visible.enemies(observation) if enemy["type"] == "archer"])
         if target is not None:
             attack_paths = self._attack_paths(paths, target, "cavalry")
             if attack_paths:
                 return self._order(self._toward_option(attack_paths, target["position"])[0], target["unit_id"], observation)
-            return self._order(self._toward(paths, target["position"]), None, observation)
-        return self._order(self._flee(paths, threats), None, observation)
+            return self._order(self._toward(observation, paths, target["position"]), None, observation)
+        return self._order(self._flee(observation, paths, threats), None, observation)
 
     def _melee_rendezvous(self, observation: SkirmishObservation, paths: list[PathOption], allies: list[VisibleUnit]) -> SkirmishAction:
         enemy_goal = self._last_seen_non_archer_goal()
@@ -119,8 +143,8 @@ class Agent:
             )
         ally_goal = self._ally_goal(observation, allies)
         if ally_goal is not None:
-            return self._order(self._toward(paths, enemy_goal or ally_goal), None, observation)
-        return self._order(self._toward(paths, enemy_goal or tile.at_center(observation)), None, observation)
+            return self._order(self._toward(observation, paths, ally_goal), None, observation)
+        return self._order(self._toward(observation, paths, enemy_goal or tile.at_center(observation)), None, observation)
 
     def _advance_with_visible_ally(
         self, observation: SkirmishObservation, paths: list[PathOption], allies: Iterable[VisibleUnit], goal: Position
@@ -134,7 +158,7 @@ class Agent:
         ]
         # Staying put is always linked to an ally already visible, but retain the general fallback
         # so this helper remains safe if future rules change what visibility means.
-        return self._toward(linked_paths or paths, goal)
+        return self._toward(observation, linked_paths or paths, goal)
 
     def _paths(self, observation: SkirmishObservation) -> list[PathOption]:
         here = me.position(observation)
@@ -148,15 +172,30 @@ class Agent:
         allies = visible.allies(observation)
         type_priority = {"archer": 0, "cavalry": 1, "footman": 2}
 
-        def score(enemy: VisibleUnit) -> tuple[int, int, int, int]:
+        def score(enemy: VisibleUnit) -> tuple[int, int, int, int, int]:
             attackable = any(self._distance(end, enemy["position"]) <= own_range for _, end in paths)
-            threatens_ally = any(self._distance(enemy["position"], ally["position"]) <= units.STATS[enemy["type"]].attack_range for ally in allies)
-            return (-int(attackable), -int(threatens_ally), type_priority[enemy["type"]], self._distance(me.position(observation), enemy["position"]))
+            killable = self._can_kill_this_turn(observation, paths, enemy)
+            threatens_ally = self._threatens_visible_ally(observation, enemy)
+            return (-int(killable), -int(attackable), -int(threatens_ally), type_priority[enemy["type"]], self._distance(me.position(observation), enemy["position"]))
 
         return min(candidates, key=score)
 
     def _attack_paths(self, paths: Iterable[PathOption], target: VisibleUnit, attacker_type: str) -> list[PathOption]:
         return [path for path in paths if self._distance(path[1], target["position"]) <= units.STATS[attacker_type].attack_range]
+
+    def _can_kill_this_turn(self, observation: SkirmishObservation, paths: list[PathOption], enemy: VisibleUnit) -> bool:
+        attack_range = units.STATS[me.unit_type(observation)].attack_range
+        damage = units.STATS[me.unit_type(observation)].damage
+        return enemy["hit_points"] <= damage and any(
+            self._distance(end, enemy["position"]) <= attack_range for _, end in paths
+        )
+
+    def _threatens_visible_ally(self, observation: SkirmishObservation, enemy: VisibleUnit) -> bool:
+        attack_range = units.STATS[enemy["type"]].attack_range
+        return any(
+            self._distance(enemy["position"], ally["position"]) <= attack_range
+            for ally in visible.allies(observation)
+        )
 
     def _safe_paths(self, paths: Iterable[PathOption], threats: Iterable[VisibleUnit]) -> list[PathOption]:
         return self._safe_memory_paths(paths, [(threat["type"], threat["position"]) for threat in threats])
@@ -165,11 +204,24 @@ class Agent:
         threats = list(threats)
         return [path for path in paths if all(self._distance(path[1], position) > self._threat_range(kind) for kind, position in threats)]
 
-    def _archer_threats(self, enemies: Iterable[VisibleUnit]) -> list[tuple[str, Position]]:
-        threats = [(enemy["type"], enemy["position"]) for enemy in enemies if enemy["type"] == "archer"]
+    def _archer_threats(
+        self, observation: SkirmishObservation, enemies: Iterable[VisibleUnit]
+    ) -> list[tuple[str, Position]]:
+        here = me.position(observation)
+        threats = [
+            (enemy["type"], enemy["position"])
+            for enemy in enemies
+            if enemy["type"] == "archer"
+            and self._distance(here, enemy["position"]) <= self._threat_range("archer")
+        ]
         visible_ids = {enemy["unit_id"] for enemy in enemies}
         for unit_id, (kind, position) in self._last_seen_enemies.items():
-            if kind == "archer" and unit_id not in visible_ids and self._activation - self._enemy_seen_on[unit_id] == 1:
+            if (
+                kind == "archer"
+                and unit_id not in visible_ids
+                and self._activation - self._enemy_seen_on[unit_id] == 1
+                and self._distance(here, position) <= self._threat_range("archer")
+            ):
                 threats.append((kind, position))
         return threats
 
@@ -187,15 +239,74 @@ class Agent:
         positions = [position for kind, position in self._last_seen_enemies.values() if kind != "archer"]
         return self._copy(self._rng.choice(positions)) if positions else None
 
-    def _toward(self, paths: Iterable[PathOption], goal: Position) -> int:
-        return self._toward_option(paths, goal)[0]
+    def _toward(self, observation: SkirmishObservation, paths: Iterable[PathOption], goal: Position) -> int:
+        center = tile.at_center(observation)
+        return min(
+            paths,
+            key=lambda option: (
+                self._distance(option[1], goal),
+                self._distance(option[1], center),
+                option[0],
+            ),
+        )[0]
 
     def _toward_option(self, paths: Iterable[PathOption], goal: Position) -> PathOption:
         return min(paths, key=lambda option: (self._distance(option[1], goal), option[0]))
 
-    def _flee(self, paths: Iterable[PathOption], threats: Iterable[tuple[str, Position]]) -> int:
+    def _flee(
+        self, observation: SkirmishObservation, paths: Iterable[PathOption], threats: Iterable[tuple[str, Position]]
+    ) -> int:
+        paths = list(paths)
         threats = list(threats)
-        return max(paths, key=lambda option: (min(self._distance(option[1], position) - self._threat_range(kind) for kind, position in threats), sum(self._distance(option[1], position) for _, position in threats), -option[0]))[0]
+        here = me.position(observation)
+        center = tile.at_center(observation)
+        safety_margin = lambda option: min(
+            self._distance(option[1], position) - self._threat_range(kind) for kind, position in threats
+        )
+        best_margin = max(safety_margin(option) for option in paths)
+        safest_paths = [option for option in paths if safety_margin(option) == best_margin]
+        center_progress = lambda option: self._distance(here, center) - self._distance(option[1], center)
+        best_center_progress = max(center_progress(option) for option in safest_paths)
+
+        if best_center_progress <= 0:
+            last_ally = self._ally_goal(observation, [])
+            if last_ally is not None:
+                return min(
+                    safest_paths,
+                    key=lambda option: (
+                        self._distance(option[1], last_ally),
+                        -sum(self._distance(option[1], position) for _, position in threats),
+                        option[0],
+                    ),
+                )[0]
+
+        return max(
+            safest_paths,
+            key=lambda option: (
+                center_progress(option),
+                sum(self._distance(option[1], position) for _, position in threats),
+                -option[0],
+            ),
+        )[0]
+
+    def _archer_center_path(self, observation: SkirmishObservation, paths_to_score: list[PathOption]) -> int:
+        """Reach center without needlessly leading with the archer in the opening."""
+        center = tile.at_center(observation)
+        best_distance = min(self._distance(end, center) for _, end in paths_to_score)
+        comparable = [
+            option
+            for option in paths_to_score
+            if self._distance(option[1], center) <= best_distance + 1
+        ]
+        forward = me.direction(observation)
+        return min(
+            comparable,
+            key=lambda option: (
+                paths.decode(option[0]).count(forward),
+                self._distance(option[1], center),
+                option[0],
+            ),
+        )[0]
 
     def _order(self, path_id: int, target_id: str | None, observation: SkirmishObservation) -> SkirmishAction:
         if path_id == 0:
