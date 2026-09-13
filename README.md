@@ -33,12 +33,15 @@ Leave `sandbox/`, `requirements.in`, and `requirements.txt` unchanged. The pinne
 
 When your agent is ready, follow the shared [submitting guide](https://vox-deorum.github.io/game-sandbox/students/submitting/). For the optional `learn` and `chat` hooks, see the shared [agent interface](https://vox-deorum.github.io/game-sandbox/students/agent-interface/). Crane messaging begins in Season 3.
 
-## Optional LLM API
+## Design Goal
+Season 1: The goal this season was to have the units move intentionally, look for and keep track of each other and the enemies by moving to the center, and target enemies in the most efficient way with attack priority, fallback, and rescue. The archers should look for enemies and the other archer; the cavalry should look for its allies and attack all non-archers quickly; the footmen should do the same while fleeing from the enemy archer. 
 
-If your instructor enables model calls, follow [Using the LLM API](llm.md). Copy `.env.example` to `.env`, add the endpoint and key, and never commit either secret.
+## Reflection
+Season 1: I considered techniques of behavior based on role and health, keeping track of where allies and enemies were last seen, tracking enemy threat distance, prioritizing attacking certain roles, checking the cost of attacking vs. fleeing, supporting allies through rescue, and the archer covering allies and removing the enemy archer early. The hardest part was calculating the threat and whether taking the chance of attacking rather than fleeing was worth it- it took a lot of tries and wasn't possible to check for more than one turn since the units couldn't communicate. One part that helped was the units having a bias to the center and keeping track of last-seen allies and enemies, as it allowed units to support and protect each other and prioritize high-potential threat enemies. The logic for it got complicated quite quickly but raised the mean score significantly. I think I would rework these two and look into how I can protect the archer from the cavalry better, as that was why many games were lost. Something I struggled with and had to revert was whether cavalry/footmen would risk getting help to support another ally, and calculating the cavalry's risk assessment past two turns from the archer. I might try adding memory caps and risk assessments next time.
 
-Test the connection with:
 
-```console
-python -m sandbox llm
-```
+## AI Use Disclosure and Reflection
+I used Claude to refine my ideas and pseudocode and discussed possible issues and solutions with it before having it format information for Codex, and it was done in the form of a discussion where I verified everything it said and corrected it where needed, telling it not to write anything for me, just to correct me where I miss things. It overcomplicated a lot of words and was unable to understand some things since it didn't have access to the code files, so I had to clarify a lot. 
+I used Codex to code in VS Code, discussing and planning with it before making multiple changes to agent.py. I verified its code before approving it and allowing it to make changes. I did not add any code manually, but I checked its code, reverted, tested it, and asked for changes when needed. I checked the eval and mean score every time before pushing to main. 
+It only made changes to the code that I described and asked for through my pseudocode and planning. It made changes to class behavior, last seen info, threat calculation, kiting, rescue, tiebreakers, prioritisation, freeing, and engaging. However, it was hard to validate a lot of it, as it made all the changes I specified at once instead of one by one as I asked, and there were places where it misinterpreted or was unable to think for itself about what was needed, so I would plan with it more before starting and give it rules to start with next time. 
+
