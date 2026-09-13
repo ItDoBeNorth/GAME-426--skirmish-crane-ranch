@@ -1,80 +1,227 @@
-"""A working Crane starter agent.
+"""A role-based Season 1 agent for Skirmish at Crane Reach.
 
-Each unit runs a separate instance of this class. This starter walks forward until it sees an
-enemy, then takes one legal step toward the nearest visible enemy and names it. Start at the
-``TODO(you)`` comments.
-Read ``environment.md`` beside this file for the rules, helpers, and first improvement. Prepare
-episode state in ``reset``. The constructor takes no arguments.
+Each unit runs a separate instance of this class. Read ``environment.md`` beside this file for
+the rules, helpers, and later-season mechanics. Prepare episode state in ``reset``; the
+constructor takes no arguments. Movement always comes from the action mask: this agent scores
+complete legal paths rather than recreating movement rules.
 """
 
-from sandbox.crane import action, me, tile, visible
-from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+from sandbox.crane import action, me, tile, units, visible
+from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation, VisibleUnit
+
+
+Position = dict[str, int]
+PathOption = tuple[int, AxialPosition]
 
 
 class Agent:
-    """Marches toward the enemy side, then steps toward the nearest visible enemy."""
+    """Use archer kiting and local melee support to contest the center."""
 
     def reset(self, seed, observation) -> None:
         # Called once before each match. The opening observation is available here for
-        # precomputation outside the decision clock. This starter stores no state.
-        pass
+        # precomputation outside the decision clock. Each unit's memory remains private.
+        self._activation = 0
+        self._rng = random.Random(seed)
+        self._last_seen_enemies: dict[str, tuple[str, Position]] = {}
+        self._last_seen_allies: dict[str, Position] = {}
+        self._enemy_seen_on: dict[str, int] = {}
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
-        # The enemies this unit can see.
+        self._activation += 1
         enemies = visible.enemies(observation)
+        allies = visible.allies(observation)
+        self._remember(enemies, allies)
+        paths = self._paths(observation)
+        if me.unit_type(observation) == "archer":
+            return self._act_archer(observation, paths, enemies, allies)
+        return self._act_melee(observation, paths, enemies, allies)
 
-        if not enemies:
-            # At the beginning of a default skirmish match, units sit apart and see no enemies.
-            # me.direction is the digit toward the enemy side, so this unit heads that way.
-            forward = me.direction(observation)
+    def _remember(self, enemies: Iterable[VisibleUnit], allies: Iterable[VisibleUnit]) -> None:
+        for enemy in enemies:
+            self._last_seen_enemies[enemy["unit_id"]] = (enemy["type"], self._copy(enemy["position"]))
+            self._enemy_seen_on[enemy["unit_id"]] = self._activation
+        for ally in allies:
+            self._last_seen_allies[ally["unit_id"]] = self._copy(ally["position"])
 
-            # legal_steps lists the single steps allowed by the mask. Checking membership keeps
-            # this order legal when a wall, ally, or enemy blocks the way.
-            if forward in action.legal_steps(observation):
-                return action.move(forward)
+    def _act_archer(self, observation: SkirmishObservation, paths: list[PathOption], enemies: list[VisibleUnit], allies: list[VisibleUnit]) -> SkirmishAction:
+        target = self._select_target(observation, paths, enemies)
+        if target is not None:
+            firing_paths = self._attack_paths(paths, target, "archer")
+            if firing_paths:
+                melee_threats = [enemy for enemy in enemies if enemy["type"] in {"cavalry", "footman"}]
+                choices = self._safe_paths(firing_paths, melee_threats) or firing_paths
+                # Kite while preserving the shot: prefer the farthest firing endpoint.
+                path = max(choices, key=lambda option: (self._distance(option[1], target["position"]), -option[0]))
+                return self._order(path[0], target["unit_id"], observation)
+        enemy_goal = self._last_seen_goal("archer")
+        if allies:
+            return self._order(
+                self._advance_with_visible_ally(observation, paths, allies, enemy_goal or tile.at_center(observation)),
+                None,
+                observation,
+            )
+        goal = enemy_goal or self._ally_goal(observation, allies) or tile.at_center(observation)
+        return self._order(self._toward(paths, goal), None, observation)
 
-            # TODO(you): this unit stands still when something blocks the way.
-            # It may still attack, but can you choose a better response?
-            return action.stay()
+    def _act_melee(self, observation: SkirmishObservation, paths: list[PathOption], enemies: list[VisibleUnit], allies: list[VisibleUnit]) -> SkirmishAction:
+        unit_type = me.unit_type(observation)
+        attack_range = units.STATS[unit_type].attack_range
+        adjacent = [enemy for enemy in enemies if self._distance(me.position(observation), enemy["position"]) <= attack_range]
+        if adjacent:
+            target = self._select_target(observation, paths, adjacent)
+            return self._order(0, target["unit_id"] if target else None, observation)
 
-        # TODO(you): walking toward the nearest enemy is the entire strategy, and it is weak.
-        # An archer should shoot and back away, cavalry should swing wide for a flank, and a
-        # footman should hold the line beside an ally. What should each of your units do?
+        archer_threats = self._archer_threats(enemies)
+        if archer_threats:
+            opportunistic = self._select_target(observation, paths, [enemy for enemy in enemies if enemy["type"] in {"cavalry", "footman"}])
+            if opportunistic is not None:
+                attack_paths = self._attack_paths(paths, opportunistic, unit_type)
+                if attack_paths:
+                    return self._order(self._toward_option(attack_paths, opportunistic["position"])[0], opportunistic["unit_id"], observation)
+            return self._archer_response(observation, paths, archer_threats)
 
-        # This unit's current {"q": ..., "r": ...} position.
+        target = self._select_target(observation, paths, [enemy for enemy in enemies if enemy["type"] in {"cavalry", "footman"}])
+        if target is not None:
+            attack_paths = self._attack_paths(paths, target, unit_type)
+            if attack_paths:
+                return self._order(self._toward_option(attack_paths, target["position"])[0], target["unit_id"], observation)
+            safer_paths = self._safe_paths(paths, [target])
+            return self._order(self._toward(safer_paths or paths, target["position"]), None, observation)
+        return self._melee_rendezvous(observation, paths, allies)
+
+    def _archer_response(self, observation: SkirmishObservation, paths: list[PathOption], threats: list[tuple[str, Position]]) -> SkirmishAction:
+        safe_paths = self._safe_memory_paths(paths, threats)
+        if me.unit_type(observation) == "footman":
+            return self._order(self._flee(safe_paths or paths, threats), None, observation)
+        # Cavalry's approved one-turn proxy: escape, else engage if possible, else partially engage.
+        if safe_paths:
+            return self._order(self._flee(safe_paths, threats), None, observation)
+        target = self._select_target(observation, paths, [enemy for enemy in visible.enemies(observation) if enemy["type"] == "archer"])
+        if target is not None:
+            attack_paths = self._attack_paths(paths, target, "cavalry")
+            if attack_paths:
+                return self._order(self._toward_option(attack_paths, target["position"])[0], target["unit_id"], observation)
+            return self._order(self._toward(paths, target["position"]), None, observation)
+        return self._order(self._flee(paths, threats), None, observation)
+
+    def _melee_rendezvous(self, observation: SkirmishObservation, paths: list[PathOption], allies: list[VisibleUnit]) -> SkirmishAction:
+        enemy_goal = self._last_seen_non_archer_goal()
+        if allies:
+            return self._order(
+                self._advance_with_visible_ally(observation, paths, allies, enemy_goal or tile.at_center(observation)),
+                None,
+                observation,
+            )
+        ally_goal = self._ally_goal(observation, allies)
+        if ally_goal is not None:
+            return self._order(self._toward(paths, enemy_goal or ally_goal), None, observation)
+        return self._order(self._toward(paths, enemy_goal or tile.at_center(observation)), None, observation)
+
+    def _advance_with_visible_ally(
+        self, observation: SkirmishObservation, paths: list[PathOption], allies: Iterable[VisibleUnit], goal: Position
+    ) -> int:
+        """Advance toward goal while keeping at least one currently visible ally in vision."""
+        vision = units.STATS[me.unit_type(observation)].vision
+        linked_paths = [
+            path
+            for path in paths
+            if any(self._distance(path[1], ally["position"]) <= vision for ally in allies)
+        ]
+        # Staying put is always linked to an ally already visible, but retain the general fallback
+        # so this helper remains safe if future rules change what visibility means.
+        return self._toward(linked_paths or paths, goal)
+
+    def _paths(self, observation: SkirmishObservation) -> list[PathOption]:
         here = me.position(observation)
+        return [(path_id, tile.at_path_end(here, path_id)) for path_id in action.legal_paths(observation)]
 
-        # The closest enemy in sight. min returns the enemy dictionary, not the distance.
-        nearest = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
+    def _select_target(self, observation: SkirmishObservation, paths: list[PathOption], candidates: Iterable[VisibleUnit]) -> VisibleUnit | None:
+        candidates = list(candidates)
+        if not candidates:
+            return None
+        own_range = units.STATS[me.unit_type(observation)].attack_range
+        allies = visible.allies(observation)
+        type_priority = {"archer": 0, "cavalry": 1, "footman": 2}
 
-        # The step that gets closest to the enemy, or 0 when no step gets closer.
-        step = self._step_toward(observation, nearest["position"])
+        def score(enemy: VisibleUnit) -> tuple[int, int, int, int]:
+            attackable = any(self._distance(end, enemy["position"]) <= own_range for _, end in paths)
+            threatens_ally = any(self._distance(enemy["position"], ally["position"]) <= units.STATS[enemy["type"]].attack_range for ally in allies)
+            return (-int(attackable), -int(threatens_ally), type_priority[enemy["type"]], self._distance(me.position(observation), enemy["position"]))
 
-        # Naming a target makes the strike prefer that enemy. Any visible enemy can be named,
-        # so both orders below are legal.
-        if step == 0:
-            return action.stay(nearest["unit_id"], observation)
-        return action.move(step, nearest["unit_id"], observation)
+        return min(candidates, key=score)
 
-    def _step_toward(self, observation: SkirmishObservation, goal: AxialPosition) -> int:
-        """Return the single step that most closes the gap to goal, or 0 when none does."""
-        # TODO(you): only single steps are tried here. A path can contain four steps, and cavalry
-        # has four movement points, so most of that speed goes to waste.
-        here = me.position(observation)
+    def _attack_paths(self, paths: Iterable[PathOption], target: VisibleUnit, attacker_type: str) -> list[PathOption]:
+        return [path for path in paths if self._distance(path[1], target["position"]) <= units.STATS[attacker_type].attack_range]
 
-        # Standing still is path id 0. A step must reduce the distance to be worth taking.
-        best_step = 0
-        best_distance = tile.distance(here, goal)
+    def _safe_paths(self, paths: Iterable[PathOption], threats: Iterable[VisibleUnit]) -> list[PathOption]:
+        return self._safe_memory_paths(paths, [(threat["type"], threat["position"]) for threat in threats])
 
-        for step in action.legal_steps(observation):
-            # at_path_end gives the landing tile, so this is the distance after the step.
-            step_distance = tile.distance(tile.at_path_end(here, step), goal)
+    def _safe_memory_paths(self, paths: Iterable[PathOption], threats: Iterable[tuple[str, Position]]) -> list[PathOption]:
+        threats = list(threats)
+        return [path for path in paths if all(self._distance(path[1], position) > self._threat_range(kind) for kind, position in threats)]
 
-            # Remember this step if it is the best one so far.
-            if step_distance < best_distance:
-                best_step, best_distance = step, step_distance
+    def _archer_threats(self, enemies: Iterable[VisibleUnit]) -> list[tuple[str, Position]]:
+        threats = [(enemy["type"], enemy["position"]) for enemy in enemies if enemy["type"] == "archer"]
+        visible_ids = {enemy["unit_id"] for enemy in enemies}
+        for unit_id, (kind, position) in self._last_seen_enemies.items():
+            if kind == "archer" and unit_id not in visible_ids and self._activation - self._enemy_seen_on[unit_id] == 1:
+                threats.append((kind, position))
+        return threats
 
-        return best_step
+    def _ally_goal(self, observation: SkirmishObservation, allies: Iterable[VisibleUnit]) -> Position | None:
+        choices = [(ally["type"], ally["position"]) for ally in allies] or [("", position) for position in self._last_seen_allies.values()]
+        if not choices:
+            return None
+        return self._copy(min(choices, key=lambda choice: (self._distance(me.position(observation), choice[1]), choice[0] != "cavalry"))[1])
+
+    def _last_seen_goal(self, unit_type: str) -> Position | None:
+        positions = [position for kind, position in self._last_seen_enemies.values() if kind == unit_type]
+        return self._copy(positions[0]) if positions else None
+
+    def _last_seen_non_archer_goal(self) -> Position | None:
+        positions = [position for kind, position in self._last_seen_enemies.values() if kind != "archer"]
+        return self._copy(self._rng.choice(positions)) if positions else None
+
+    def _toward(self, paths: Iterable[PathOption], goal: Position) -> int:
+        return self._toward_option(paths, goal)[0]
+
+    def _toward_option(self, paths: Iterable[PathOption], goal: Position) -> PathOption:
+        return min(paths, key=lambda option: (self._distance(option[1], goal), option[0]))
+
+    def _flee(self, paths: Iterable[PathOption], threats: Iterable[tuple[str, Position]]) -> int:
+        threats = list(threats)
+        return max(paths, key=lambda option: (min(self._distance(option[1], position) - self._threat_range(kind) for kind, position in threats), sum(self._distance(option[1], position) for _, position in threats), -option[0]))[0]
+
+    def _order(self, path_id: int, target_id: str | None, observation: SkirmishObservation) -> SkirmishAction:
+        if path_id == 0:
+            return action.stay(target_id, observation) if target_id else action.stay()
+        return action.move(path_id, target_id, observation) if target_id else action.move(path_id)
+
+    @staticmethod
+    def _copy(position: AxialPosition) -> Position:
+        return {"q": position["q"], "r": position["r"]}
+
+    @staticmethod
+    def _distance(first: AxialPosition, second: AxialPosition) -> int:
+        return tile.distance(first, second)
+
+    @staticmethod
+    def _threat_range(unit_type: str) -> int:
+        stats = units.STATS[unit_type]
+        return stats.movement_points + stats.attack_range
+
+    # Original template TODO notes, retained as course-reference milestones:
+    # TODO(you) (completed): this unit stood still when forward was blocked. The agent now scores
+    # every legal path and can take an alternate route toward its current strategic goal.
+    # TODO(you) (completed): walking toward the nearest enemy was the entire strategy. Archer,
+    # cavalry, and footman now use separate kiting, flee/engage, and support behavior.
+    # TODO(you) (completed): only single steps were tried. Legal paths of up to four steps are now
+    # evaluated, so cavalry can use its full movement allowance.
 
     # Optional: a reinforcement-learning hook called after every step with that step's
     # transition. Its time counts against the timing and episode budget. The order argument is
